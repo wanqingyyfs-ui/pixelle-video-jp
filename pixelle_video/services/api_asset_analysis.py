@@ -27,23 +27,30 @@ from loguru import logger
 class APIAssetAnalysisService:
     """Analyze image/video assets with a direct VLM API provider."""
 
-    IMAGE_PROMPT = """请分析这张素材图片，用中文给出适合短视频脚本创作的简洁描述。
+    IMAGE_PROMPT = """この画像素材を分析し、日本語の短い動画台本作成に使いやすい説明を書いてください。
 
-请重点说明：
-1. 画面主体、人物/商品/场景
-2. 可用于营销或叙事的关键信息
-3. 画面风格、氛围、颜色和构图
+必ず日本語で出力してください。
+中国語で出力しないでください。
 
-输出 2-5 句话，不要编造图片中不存在的信息。"""
+特に以下を簡潔に説明してください：
+1. 写っている主体、人物、商品、場所、雰囲気
+2. 動画の紹介・宣伝・ストーリーに使えるポイント
+3. 色、構図、印象、視聴者に伝わる感情
 
-    VIDEO_PROMPT = """请基于这些从同一个视频素材中抽取的关键帧，用中文概括视频内容。
+出力は2〜5文。画像に存在しない内容を作らないでください。"""
 
-请重点说明：
-1. 视频中的主体、场景和动作变化
-2. 可用于短视频脚本的卖点或叙事信息
-3. 整体风格、节奏和氛围
+    VIDEO_PROMPT = """同じ動画素材から抽出された複数のキーフレームをもとに、動画内容を日本語で要約してください。
 
-输出 3-6 句话，不要编造关键帧中看不到的信息。"""
+必ず日本語で出力してください。
+中国語で出力しないでください。
+
+特に以下を簡潔に説明してください：
+1. 動画内の主体、場所、動き、変化
+2. 短い紹介動画に使える見どころや訴求ポイント
+3. 全体の雰囲気、テンポ、印象
+
+出力は3〜6文。キーフレームに見えない内容を作らないでください。"""
+
 
     def __init__(self, config: dict, core=None):
         self.config = config
@@ -137,18 +144,23 @@ class APIAssetAnalysisService:
         return description
 
     def _default_vlm_model(self) -> str:
-        llm_model = (self.config.get("llm", {}) or {}).get("model", "")
-        model_lower = llm_model.lower()
-        if any(marker in model_lower for marker in ("qwen", "kimi", "gpt", "gemini")):
-            return llm_model
-
         providers = self.config.get("api_providers", {}) or {}
+
+        # Prefer explicitly configured VLM providers.
+        # This avoids routing asset analysis to OpenAI just because the LLM model name contains "gpt".
         if (providers.get("dashscope", {}) or {}).get("api_key"):
             return "qwen3.6-plus"
-        if (providers.get("openai", {}) or {}).get("api_key"):
-            return "gpt-5.4"
         if (providers.get("gemini", {}) or {}).get("api_key"):
             return "gemini-2.5-pro"
+        if (providers.get("openai", {}) or {}).get("api_key"):
+            return "gpt-4o"
+
+        # Fallback to LLM model only when no dedicated media/VLM provider is configured.
+        llm_model = (self.config.get("llm", {}) or {}).get("model", "")
+        model_lower = llm_model.lower()
+        if any(marker in model_lower for marker in ("qwen", "kimi", "gemini")):
+            return llm_model
+
         return "qwen3.6-plus"
 
     def _extract_video_frames(self, video_file: Path, output_dir: Path, max_frames: int) -> list[Path]:

@@ -806,6 +806,7 @@ class AssetBasedPipeline(LinearVideoPipeline):
         self.core.video.concat_videos(
             videos=scene_videos,
             output=str(final_video_path),
+            method="transition",
             bgm_path=bgm_path,
             bgm_volume=bgm_volume,
             bgm_mode=bgm_mode

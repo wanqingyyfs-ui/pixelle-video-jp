@@ -109,7 +109,7 @@ class VideoService:
         self,
         videos: List[str],
         output: str,
-        method: Literal["demuxer", "filter"] = "demuxer",
+        method: Literal["demuxer", "filter", "transition"] = "demuxer",
         bgm_path: Optional[str] = None,
         bgm_volume: float = 0.2,
         bgm_mode: Literal["once", "loop"] = "loop"
@@ -142,7 +142,12 @@ class VideoService:
         if bgm_path:
             # If BGM needed, concatenate to temp file first
             temp_output = output.replace('.mp4', '_no_bgm.mp4')
-            concat_result = self._concat_demuxer(videos, temp_output) if method == "demuxer" else self._concat_filter(videos, temp_output)
+            if method == "transition":
+                concat_result = self._concat_with_transitions(videos, temp_output)
+            elif method == "demuxer":
+                concat_result = self._concat_demuxer(videos, temp_output)
+            else:
+                concat_result = self._concat_filter(videos, temp_output)
             
             # Step 2: Add BGM
             logger.info(f"Adding BGM: {bgm_path} (volume={bgm_volume}, mode={bgm_mode})")
@@ -161,7 +166,9 @@ class VideoService:
             return final_result
         else:
             # No BGM, direct concatenation
-            if method == "demuxer":
+            if method == "transition":
+                return self._concat_with_transitions(videos, output)
+            elif method == "demuxer":
                 return self._concat_demuxer(videos, output)
             else:
                 return self._concat_filter(videos, output)
@@ -252,6 +259,130 @@ class VideoService:
             logger.error(f"Concatenation error: {e}")
             raise RuntimeError(f"Failed to concatenate videos: {e}")
     
+    def _concat_with_transitions(
+        self,
+        videos: List[str],
+        output: str,
+        transition_duration: float = 0.55
+    ) -> str:
+        """
+        Concatenate videos with visual transitions and audio crossfade.
+        Uses FFmpeg xfade/acrossfade.
+        """
+        self._ensure_ffmpeg()
+
+        if not videos:
+            raise ValueError("Videos list cannot be empty")
+
+        if len(videos) == 1:
+            logger.info(f"Only one video provided, copying to {output}")
+            shutil.copy(videos[0], output)
+            return output
+
+        import subprocess
+
+        transitions = [
+            "fade",
+            "wipeleft",
+            "wiperight",
+            "wipeup",
+            "wipedown",
+            "circleopen",
+            "circleclose",
+            "fadeblack",
+            "fadewhite",
+        ]
+
+        durations = [max(self._get_video_duration(video), 0.1) for video in videos]
+        min_duration = min(durations)
+        transition_duration = min(transition_duration, max(0.2, min_duration / 3))
+
+        logger.info(
+            f"Concatenating {len(videos)} videos with transitions "
+            f"(transition_duration={transition_duration:.2f}s)"
+        )
+
+        cmd = ["ffmpeg", "-y"]
+
+        for video in videos:
+            cmd.extend(["-i", video])
+
+        filter_parts = []
+        n = len(videos)
+
+        for i in range(n):
+            filter_parts.append(
+                f"[{i}:v]"
+                f"scale=1080:1920:force_original_aspect_ratio=decrease,"
+                f"pad=1080:1920:(ow-iw)/2:(oh-ih)/2,"
+                f"setsar=1,fps=30,format=yuv420p,setpts=PTS-STARTPTS"
+                f"[v{i}]"
+            )
+            filter_parts.append(
+                f"[{i}:a]"
+                f"aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo,"
+                f"asetpts=PTS-STARTPTS"
+                f"[a{i}]"
+            )
+
+        current_v = "v0"
+        current_a = "a0"
+        current_duration = durations[0]
+
+        for i in range(1, n):
+            transition = transitions[(i - 1) % len(transitions)]
+            offset = max(0.1, current_duration - transition_duration)
+
+            next_v = f"vx{i}"
+            next_a = f"ax{i}"
+
+            filter_parts.append(
+                f"[{current_v}][v{i}]"
+                f"xfade=transition={transition}:duration={transition_duration}:offset={offset}"
+                f"[{next_v}]"
+            )
+            filter_parts.append(
+                f"[{current_a}][a{i}]"
+                f"acrossfade=d={transition_duration}:c1=tri:c2=tri"
+                f"[{next_a}]"
+            )
+
+            current_v = next_v
+            current_a = next_a
+            current_duration = current_duration + durations[i] - transition_duration
+
+        filter_complex = ";".join(filter_parts)
+
+        cmd.extend([
+            "-filter_complex", filter_complex,
+            "-map", f"[{current_v}]",
+            "-map", f"[{current_a}]",
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "20",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            output,
+        ])
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+            )
+            logger.success(f"Videos concatenated with transitions successfully: {output}")
+            return output
+
+        except subprocess.CalledProcessError as e:
+            error_msg = e.stderr if e.stderr else str(e)
+            logger.error(f"FFmpeg transition concat error: {error_msg}")
+            raise RuntimeError(f"Failed to concatenate videos with transitions: {error_msg}")
+
     def _get_video_duration(self, video: str) -> float:
         """Get video duration in seconds"""
         try:

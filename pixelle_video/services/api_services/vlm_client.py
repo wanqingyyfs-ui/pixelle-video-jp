@@ -34,12 +34,18 @@ class VLM:
             api_key=gemini_api_key or Config.GEMINI_API_KEY,
             base_url=gemini_base_url or Config.GOOGLE_GEMINI_BASE_URL
         )
-        # Initialize GPT Client
-        self.gpt_client = GPTVLClient(
-            api_key=gpt_api_key or Config.OPENAI_API_KEY,
-            base_url=gpt_base_url or Config.OPENAI_BASE_URL,
-            local_proxy=local_proxy or Config.LOCAL_PROXY
-        )
+
+        # Initialize GPT Client only when OpenAI API key is configured.
+        # Otherwise DashScope/Gemini VLM can still work without OpenAI credentials.
+        final_gpt_api_key = gpt_api_key or Config.OPENAI_API_KEY
+        if final_gpt_api_key:
+            self.gpt_client = GPTVLClient(
+                api_key=final_gpt_api_key,
+                base_url=gpt_base_url or Config.OPENAI_BASE_URL,
+                local_proxy=local_proxy or Config.LOCAL_PROXY
+            )
+        else:
+            self.gpt_client = None
 
     def query(self,
              prompt: str,
@@ -76,6 +82,8 @@ class VLM:
                     processed_images.append(p)  # 传递原始路径，内部会处理
             return self.gemini_client.chat(text=prompt, images=processed_images, model=model)
         elif is_gpt:
+            if self.gpt_client is None:
+                raise ValueError("OpenAI API Key 未配置。请填写 OpenAI API Key，或把素材分析模型改为 DashScope/Qwen。")
             return self.gpt_client.chat(text=prompt, images=image_paths or [], model=model)
         else:
             # DashScope (Qwen/Kimi) - 需要将 base64 保存为临时文件

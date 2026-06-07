@@ -186,13 +186,48 @@ class TTSService(ComfyBaseService):
                 rate=rate,
                 output_path=output_path
             )
-            
+
             logger.info(f"✅ Generated audio (local Edge TTS): {output_path}")
             return output_path
-        
+
         except Exception as e:
-            logger.error(f"Local TTS generation error: {e}")
-            raise
+            logger.warning(f"Local Edge TTS stream failed, falling back to edge-tts CLI: {e}")
+
+            import subprocess
+            import sys
+
+            cli_cmd = [
+                sys.executable,
+                "-m",
+                "edge_tts",
+                "--voice",
+                final_voice,
+                "--rate",
+                rate,
+                "--text",
+                text,
+                "--write-media",
+                output_path,
+            ]
+
+            result = subprocess.run(
+                cli_cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=180,
+            )
+
+            if result.returncode != 0:
+                logger.error(f"Edge TTS CLI fallback failed: {result.stderr or result.stdout}")
+                raise
+
+            if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+                raise RuntimeError(f"Edge TTS CLI fallback did not create audio file: {output_path}")
+
+            logger.info(f"✅ Generated audio via edge-tts CLI fallback: {output_path}")
+            return output_path
     
     async def _call_comfyui_workflow(
         self,

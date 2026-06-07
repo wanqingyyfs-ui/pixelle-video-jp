@@ -119,6 +119,48 @@ EDGE_TTS_VOICES: List[Dict[str, Any]] = [
         "gender": "female"
     },
     {
+        "id": "ja-JP-NanamiNeural",
+        "label_key": "tts.voice.ja_JP_NanamiNeural",
+        "locale": "ja-JP",
+        "gender": "female"
+    },
+    {
+        "id": "ja-JP-KeitaNeural",
+        "label_key": "tts.voice.ja_JP_KeitaNeural",
+        "locale": "ja-JP",
+        "gender": "male"
+    },
+    {
+        "id": "ja-JP-AoiNeural",
+        "label_key": "tts.voice.ja_JP_AoiNeural",
+        "locale": "ja-JP",
+        "gender": "female"
+    },
+    {
+        "id": "ja-JP-DaichiNeural",
+        "label_key": "tts.voice.ja_JP_DaichiNeural",
+        "locale": "ja-JP",
+        "gender": "male"
+    },
+    {
+        "id": "ja-JP-MayuNeural",
+        "label_key": "tts.voice.ja_JP_MayuNeural",
+        "locale": "ja-JP",
+        "gender": "female"
+    },
+    {
+        "id": "ja-JP-NaokiNeural",
+        "label_key": "tts.voice.ja_JP_NaokiNeural",
+        "locale": "ja-JP",
+        "gender": "male"
+    },
+    {
+        "id": "ja-JP-ShioriNeural",
+        "label_key": "tts.voice.ja_JP_ShioriNeural",
+        "locale": "ja-JP",
+        "gender": "female"
+    },
+    {
         "id": "fr-FR-EloiseNeural",
         "label_key": "tts.voice.fr-FR-EloiseNeural",
         "locale": "fr-FR",

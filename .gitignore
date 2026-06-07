@@ -74,3 +74,12 @@ examples/
 repositories/
 
 *.out
+
+config.yaml
+.venv/
+output/
+data/
+*.mp4
+*.mp3
+*.wav
+*.log
