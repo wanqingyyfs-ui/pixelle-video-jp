@@ -1,4 +1,4 @@
-﻿# Copyright (C) 2025 AIDC-AI
+# Copyright (C) 2025 AIDC-AI
 #
 # Licensed under the Apache License, Version 2.0
 
@@ -30,17 +30,26 @@ Use exact paths from the list below. Do not modify asset paths.
 {assets_text}
 
 ## Creation Guidelines
-1. Generate 3-8 scenes depending on target duration.
-2. Assign one asset from available assets to each scene.
-3. Each scene should contain 1-2 short Japanese narration sentences.
-4. Try to use all available assets when possible.
-5. Total duration should approximately equal {duration} seconds.
-6. The style should feel warm, elegant, gentle, slightly lonely, but still positive.
-7. Avoid exaggerated, cheap advertising language.
-8. Avoid Chinese words completely.
+1. If the asset list contains `Planned Scene`, generate exactly those planned scenes in the same order.
+2. Do not add extra scenes.
+3. Do not remove planned scenes.
+4. Use the exact asset_path from each planned scene.
+5. Each scene must contain exactly ONE short Japanese narration sentence.
+6. The narration sentence must stay within the `Max narration chars` limit for that scene.
+7. Image scenes must feel calm and short; never assume an image scene lasts more than 5 seconds.
+8. Total narration length must fit approximately within {duration} seconds.
+9. The style should feel warm, elegant, gentle, slightly lonely, but still positive.
+10. Avoid exaggerated, cheap advertising language.
+11. Avoid Chinese words completely.
 {title_instruction}
 
 ## Output Requirements
+- You MUST generate `full_narration`: one continuous, natural Japanese narration for the whole video.
+- `full_narration` must sound like one complete spoken monologue, not separate scene captions.
+- `full_narration` should approximately match the requested target duration.
+- Scene `narrations` are only used as short subtitle hints for each visual scene.
+- Do not make scene narrations feel like separate independent speeches.
+
 Provide for each scene:
 - scene_number: Scene number starting from 1
 - asset_path: Exact path selected from the available assets list

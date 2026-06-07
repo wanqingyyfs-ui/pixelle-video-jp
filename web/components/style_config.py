@@ -82,7 +82,7 @@ def render_style_config(pixelle_video):
             
             # Get saved voice from config
             local_config = tts_config.get("local", {})
-            saved_voice = local_config.get("voice", "zh-CN-YunjianNeural")
+            saved_voice = local_config.get("voice", "ja-JP-NanamiNeural")
             saved_speed = local_config.get("speed", 1.2)
             
             # Build voice options with i18n

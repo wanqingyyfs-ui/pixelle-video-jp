@@ -735,6 +735,7 @@ class VideoService:
         audio: str,
         output: str,
         fps: int = 30,
+        duration: Optional[float] = None,
     ) -> str:
         """
         Create video from static image and audio
@@ -776,6 +777,12 @@ class VideoService:
             # Use framerate to set input framerate
             input_image = ffmpeg.input(image, loop=1, framerate=fps)
             input_audio = ffmpeg.input(audio)
+            audio_stream = input_audio.audio
+            target_duration = float(duration or audio_duration)
+            if target_duration <= 0:
+                target_duration = audio_duration
+            if audio_duration < target_duration:
+                audio_stream = audio_stream.filter('apad', whole_dur=target_duration)
             
             # Combine image and audio
             # Use -t to explicitly set video duration = audio duration
@@ -783,9 +790,9 @@ class VideoService:
                 ffmpeg
                 .output(
                     input_image,
-                    input_audio,
+                    audio_stream,
                     output,
-                    t=audio_duration,  # Force video duration to match audio exactly
+                    t=target_duration,  # Force video duration to planned scene duration
                     vcodec='libx264',
                     acodec='aac',
                     pix_fmt='yuv420p',
@@ -798,7 +805,7 @@ class VideoService:
                 .run(capture_stdout=True, capture_stderr=True)
             )
             
-            logger.success(f"Video created from image: {output} (duration: {audio_duration:.3f}s)")
+            logger.success(f"Video created from image: {output} (duration: {target_duration:.3f}s)")
             return output
         except ffmpeg.Error as e:
             error_msg = e.stderr.decode() if e.stderr else str(e)

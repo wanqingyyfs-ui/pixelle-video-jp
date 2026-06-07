@@ -240,7 +240,7 @@ class StandardPipeline(LinearVideoPipeline):
         if tts_inference_mode:
             # New API from web UI
             if tts_inference_mode == "local":
-                final_voice_id = tts_voice or "zh-CN-YunjianNeural"
+                final_voice_id = tts_voice or "ja-JP-NanamiNeural"
                 final_tts_workflow = None
                 logger.debug(f"TTS Mode: local (voice={final_voice_id})")
             elif tts_inference_mode == "comfyui":
@@ -248,7 +248,7 @@ class StandardPipeline(LinearVideoPipeline):
                 logger.debug(f"TTS Mode: comfyui (workflow={final_tts_workflow})")
         else:
             # Old API
-            final_voice_id = voice_id or tts_voice or "zh-CN-YunjianNeural"
+            final_voice_id = voice_id or tts_voice or "ja-JP-NanamiNeural"
             logger.debug(f"TTS Mode: legacy (voice_id={final_voice_id}, workflow={final_tts_workflow})")
             
         # Create config

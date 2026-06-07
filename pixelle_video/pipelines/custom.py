@@ -137,7 +137,7 @@ class CustomPipeline(BasePipeline):
             # New API from web UI
             if tts_inference_mode == "local":
                 # Local Edge TTS mode - use tts_voice
-                final_voice_id = tts_voice or "zh-CN-YunjianNeural"
+                final_voice_id = tts_voice or "ja-JP-NanamiNeural"
                 final_tts_workflow = None  # Don't use workflow in local mode
                 logger.debug(f"TTS Mode: local (voice={final_voice_id})")
             elif tts_inference_mode == "comfyui":
@@ -147,7 +147,7 @@ class CustomPipeline(BasePipeline):
                 logger.debug(f"TTS Mode: comfyui (workflow={final_tts_workflow})")
         else:
             # Old API (backward compatibility)
-            final_voice_id = voice_id or tts_voice or "zh-CN-YunjianNeural"
+            final_voice_id = voice_id or tts_voice or "ja-JP-NanamiNeural"
             # tts_workflow already set from parameter
             logger.debug(f"TTS Mode: legacy (voice_id={final_voice_id}, workflow={final_tts_workflow})")
         

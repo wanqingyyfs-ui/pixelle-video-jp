@@ -35,6 +35,7 @@ Example:
 from typing import List, Dict, Any, Optional, Callable
 from pathlib import Path
 import math
+import random
 from datetime import datetime
 
 from loguru import logger
@@ -64,6 +65,10 @@ class SceneScript(BaseModel):
 
 class VideoScript(BaseModel):
     """Complete video script with scenes"""
+    full_narration: Optional[str] = Field(
+        default=None,
+        description="One continuous natural Japanese narration for the whole video"
+    )
     scenes: List[SceneScript] = Field(description="List of scenes in the video")
 
 
@@ -332,11 +337,25 @@ class AssetBasedPipeline(LinearVideoPipeline):
         duration = context.request.get("duration", 30)
         title = context.title  # May be empty if user didn't provide one
         
-        # Prepare asset descriptions with full paths for LLM to reference
+        # Build deterministic scene plan:
+        # - random asset order
+        # - image scenes <= 5 seconds
+        # - videos use full original duration
+        # - no repeat until every asset has been used once
+        scene_plan = self._build_asset_scene_plan(target_duration=float(duration))
+        context.scene_plan = scene_plan
+
         asset_info = []
-        for asset_path, metadata in self.asset_index.items():
-            asset_info.append(f"- Path: {asset_path}\n  Description: {metadata['description']}")
-        
+        for item in scene_plan:
+            asset_info.append(
+                f"- Planned Scene {item['scene_number']}\n"
+                f"  Path: {item['asset_path']}\n"
+                f"  Asset type: {item['asset_type']}\n"
+                f"  Target duration: {item['duration']:.2f} seconds\n"
+                f"  Max narration chars: {item['max_narration_chars']}\n"
+                f"  Description: {item['description']}"
+            )
+
         assets_text = "\n".join(asset_info)
         
         # Build prompt using the centralized prompt function
@@ -355,8 +374,26 @@ class AssetBasedPipeline(LinearVideoPipeline):
             max_tokens=4000
         )
         
-        # Convert to dict format for compatibility with downstream code
-        context.script = [scene.model_dump() for scene in script.scenes]
+        # Convert to dict format and force it to follow the planned scene schedule.
+        raw_script = [scene.model_dump() for scene in script.scenes]
+        context.script = self._normalize_script_to_scene_plan(raw_script, scene_plan)
+
+        planned_total_duration = sum(float(item.get("duration") or 0) for item in scene_plan)
+        context.planned_total_duration = planned_total_duration
+
+        fallback_narration = " ".join(
+            " ".join(scene.get("narrations") or [])
+            for scene in context.script
+        )
+        context.full_narration = self._build_partner_full_narration(
+            intent=intent,
+            llm_text=getattr(script, "full_narration", None) or fallback_narration,
+            target_duration=planned_total_duration,
+        )
+        logger.info(
+            f"Full narration prepared: chars={len(context.full_narration)}, "
+            f"planned_duration={planned_total_duration:.2f}s"
+        )
         
         # Validate asset paths exist
         for scene in context.script:
@@ -483,7 +520,7 @@ class AssetBasedPipeline(LinearVideoPipeline):
             max_narration_words=50,
             video_fps=30,
             tts_inference_mode="local",
-            voice_id=context.params.get("voice_id", "zh-CN-YunjianNeural"),
+            voice_id=context.params.get("voice_id", "ja-JP-NanamiNeural"),
             tts_speed=context.params.get("tts_speed", 1.2),
             media_width=media_width,
             media_height=media_height,
@@ -533,6 +570,7 @@ class AssetBasedPipeline(LinearVideoPipeline):
             
             # Store scene info for later audio generation
             frame._scene_data = scene  # Temporary storage for multi-narration
+            frame.target_duration = float(scene.get("duration") or 0)
             
             context.storyboard.frames.append(frame)
         
@@ -560,6 +598,33 @@ class AssetBasedPipeline(LinearVideoPipeline):
         base_progress = 0.30
         progress_range = 0.55  # 85% - 30%
         
+        # Generate one continuous narration audio for the whole video.
+        full_narration_text = getattr(context, "full_narration", "") or context.input_text or ""
+        full_audio_path = Path(context.task_dir) / "frames" / "00_full_narration.mp3"
+        full_audio_path.parent.mkdir(parents=True, exist_ok=True)
+
+        await self.core.tts(
+            text=full_narration_text,
+            output_path=str(full_audio_path),
+            voice=config.voice_id,
+            speed=config.tts_speed
+        )
+
+        planned_total_duration = float(getattr(context, "planned_total_duration", 0) or 0)
+        if planned_total_duration <= 0:
+            planned_total_duration = sum(
+                float(getattr(frame, "target_duration", 0) or getattr(frame, "duration", 0) or 0)
+                for frame in storyboard.frames
+            )
+
+        fitted_full_audio_path = Path(context.task_dir) / "frames" / "00_full_narration_fitted.mp3"
+        context.full_narration_audio_path = self._fit_audio_to_duration(
+            str(full_audio_path),
+            planned_total_duration,
+            str(fitted_full_audio_path),
+        )
+        logger.info(f"? Full narration audio ready: {context.full_narration_audio_path}")
+
         for i, frame in enumerate(storyboard.frames, 1):
             logger.info(f"Producing scene {i}/{total_frames}...")
             
@@ -581,68 +646,16 @@ class AssetBasedPipeline(LinearVideoPipeline):
                 narrations = [narrations]
             
             logger.info(f"Scene {i} has {len(narrations)} narration(s)")
+            frame.target_duration = float(scene.get("duration") or 0)
             
-            # Step 1: Generate audio for each narration and combine
-            narration_audios = []
-            for j, narration_text in enumerate(narrations, 1):
-                audio_path = Path(context.task_dir) / "frames" / f"{i:02d}_narration_{j}.mp3"
-                audio_path.parent.mkdir(parents=True, exist_ok=True)
-                
-                await self.core.tts(
-                    text=narration_text,
-                    output_path=str(audio_path),
-                    voice=config.voice_id,
-                    speed=config.tts_speed
-                )
-                
-                narration_audios.append(str(audio_path))
-                logger.debug(f"  Narration {j}/{len(narrations)}: {narration_text[:30]}...")
-            
-            # Concatenate all narration audios for this scene
-            if len(narration_audios) > 1:
-                from pixelle_video.utils.os_util import get_task_frame_path
-                
-                # Emit progress for combining audio
-                frame_progress = base_progress + ((i - 1) + 0.25) / total_frames * progress_range
-                self._emit_progress(ProgressEvent(
-                    event_type="frame_step",
-                    progress=frame_progress,
-                    frame_current=i,
-                    frame_total=total_frames,
-                    step=2,
-                    action="audio"
-                ))
-                
-                combined_audio_path = Path(context.task_dir) / "frames" / f"{i:02d}_audio.mp3"
-                
-                # Use FFmpeg to concatenate audio files
-                import subprocess
-                
-                # Create a file list for FFmpeg concat
-                filelist_path = Path(context.task_dir) / "frames" / f"{i:02d}_audiolist.txt"
-                with open(filelist_path, 'w') as f:
-                    for audio_file in narration_audios:
-                        escaped_path = str(Path(audio_file).absolute()).replace("'", "'\\''")
-                        f.write(f"file '{escaped_path}'\n")
-                
-                # Concatenate audio files
-                concat_cmd = [
-                    'ffmpeg',
-                    '-f', 'concat',
-                    '-safe', '0',
-                    '-i', str(filelist_path),
-                    '-c', 'copy',
-                    '-y',
-                    str(combined_audio_path)
-                ]
-                
-                subprocess.run(concat_cmd, check=True, capture_output=True)
-                frame.audio_path = str(combined_audio_path)
-                
-                logger.info(f"✅ Combined {len(narration_audios)} narrations into one audio")
-            else:
-                frame.audio_path = narration_audios[0]
-            
+            # Step 1: Create silent placeholder audio for this visual scene.
+            # The real narration is generated once for the entire video and merged in post-production.
+            scene_duration = float(getattr(frame, "target_duration", 0) or scene.get("duration") or 1.0)
+            silent_audio_path = Path(context.task_dir) / "frames" / f"{i:02d}_silence.wav"
+            self._create_silent_audio(str(silent_audio_path), scene_duration)
+            frame.audio_path = str(silent_audio_path)
+            frame.duration = scene_duration
+
             # Step 2: Use FrameProcessor to generate composed frame and video
             # FrameProcessor will handle:
             # - Template rendering (with proper dimensions)
@@ -675,6 +688,8 @@ class AssetBasedPipeline(LinearVideoPipeline):
             ]
             duration_result = subprocess.run(duration_cmd, capture_output=True, text=True, check=True)
             frame.duration = float(duration_result.stdout.strip())
+            if not getattr(frame, "target_duration", 0):
+                frame.target_duration = frame.duration
 
             api_video_workflow = context.request.get("api_video_workflow")
             api_video_generated_for_frame = False
@@ -691,7 +706,7 @@ class AssetBasedPipeline(LinearVideoPipeline):
 
                 # Asset-based scenes should follow narration duration, not the UI default duration.
                 api_video_params.pop("duration", None)
-                api_duration = max(1, int(math.ceil(frame.duration or 5)))
+                api_duration = max(1, int(math.ceil(getattr(frame, "target_duration", 0) or frame.duration or 5)))
 
                 reference_image_path = frame.image_path
                 if getattr(context, "_last_api_video_tail_frame", None):
@@ -752,6 +767,9 @@ class AssetBasedPipeline(LinearVideoPipeline):
                 if extracted_tail:
                     context._last_api_video_tail_frame = extracted_tail
 
+            actual_segment_duration = self._probe_video_duration(processed_frame.video_segment_path) if processed_frame.video_segment_path else 0
+            if actual_segment_duration > 0:
+                processed_frame.duration = actual_segment_duration
             storyboard.total_duration += processed_frame.duration or frame.duration or 0
             
             logger.success(f"✅ Scene {i} complete")
@@ -794,6 +812,7 @@ class AssetBasedPipeline(LinearVideoPipeline):
             filename = f"{context.task_id}.mp4"  # Use task_id as filename when title is empty
         
         final_video_path = Path(context.task_dir) / filename
+        visual_video_path = Path(context.task_dir) / f"visual_{filename}"
         
         # Get BGM parameters
         bgm_path = context.request.get("bgm_path")
@@ -805,12 +824,34 @@ class AssetBasedPipeline(LinearVideoPipeline):
         
         self.core.video.concat_videos(
             videos=scene_videos,
-            output=str(final_video_path),
+            output=str(visual_video_path),
             method="transition",
             bgm_path=bgm_path,
             bgm_volume=bgm_volume,
             bgm_mode=bgm_mode
         )
+
+        full_narration_audio = getattr(context, "full_narration_audio_path", None)
+        if full_narration_audio:
+            visual_duration = self._probe_video_duration(str(visual_video_path))
+            fitted_audio_path = Path(context.task_dir) / "frames" / "00_full_narration_final_fit.mp3"
+            final_audio = self._fit_audio_to_duration(
+                full_narration_audio,
+                visual_duration,
+                str(fitted_audio_path),
+            )
+
+            self.core.video.merge_audio_video(
+                video=str(visual_video_path),
+                audio=final_audio,
+                output=str(final_video_path),
+                replace_audio=False,
+                audio_volume=1.0,
+                video_volume=1.0,
+                auto_adjust_duration=False,
+            )
+        else:
+            final_video_path = visual_video_path
         
         context.final_video_path = str(final_video_path)
         context.storyboard.final_video_path = str(final_video_path)
@@ -921,6 +962,248 @@ class AssetBasedPipeline(LinearVideoPipeline):
             logger.error(f"Failed to persist task data: {e}")
             # Don't raise - persistence failure shouldn't break video generation
     
+    def _build_asset_scene_plan(self, target_duration: float) -> List[Dict[str, Any]]:
+        """
+        Build a strict random scene plan.
+
+        Rules:
+        - Random asset order.
+        - Images are capped at 5 seconds.
+        - Videos use their full duration.
+        - Assets are not repeated until all available assets have been used once.
+        - If target duration is still not reached, randomly reuse assets.
+        """
+        target_duration = max(float(target_duration or 1), 1.0)
+
+        assets = []
+        for asset_path, metadata in self.asset_index.items():
+            asset_type = metadata.get("type") or self._get_asset_type(Path(asset_path))
+            assets.append({
+                "asset_path": asset_path,
+                "asset_type": asset_type,
+                "description": metadata.get("description", ""),
+            })
+
+        if not assets:
+            raise ValueError("No valid assets available for scene planning.")
+
+        scene_plan: List[Dict[str, Any]] = []
+        total = 0.0
+        pass_index = 0
+
+        # Safety guard prevents accidental infinite loops.
+        while total < target_duration - 0.25 and pass_index < 20:
+            pool = assets.copy()
+            random.shuffle(pool)
+
+            added_this_pass = False
+
+            for asset in pool:
+                if total >= target_duration - 0.25:
+                    break
+
+                remaining = target_duration - total
+                asset_path = asset["asset_path"]
+                asset_type = asset["asset_type"]
+
+                if asset_type == "video":
+                    duration = self._probe_video_duration(asset_path)
+                    if duration <= 0:
+                        duration = min(5.0, max(1.2, remaining))
+                else:
+                    # Image scenes must not exceed 5 seconds.
+                    if remaining < 0.8 and scene_plan:
+                        previous = scene_plan[-1]
+                        if previous["asset_type"] == "image" and previous["duration"] + remaining <= 5.0:
+                            previous["duration"] = round(previous["duration"] + remaining, 2)
+                            previous["max_narration_chars"] = self._narration_char_limit(previous["duration"])
+                            total += remaining
+                        break
+
+                    duration = min(5.0, remaining)
+                    duration = max(1.2, duration)
+
+                scene_plan.append({
+                    "scene_number": len(scene_plan) + 1,
+                    "asset_path": asset_path,
+                    "asset_type": asset_type,
+                    "duration": round(float(duration), 2),
+                    "max_narration_chars": self._narration_char_limit(float(duration)),
+                    "description": asset.get("description", ""),
+                })
+
+                total += float(duration)
+                added_this_pass = True
+
+            if not added_this_pass:
+                break
+
+            # Only after one complete pass can assets be reused.
+            pass_index += 1
+
+        logger.info(
+            f"Built asset scene plan: scenes={len(scene_plan)}, "
+            f"planned_duration={sum(item['duration'] for item in scene_plan):.2f}s, "
+            f"target={target_duration:.2f}s"
+        )
+
+        return scene_plan
+
+    def _narration_char_limit(self, duration: float) -> int:
+        """Approximate Japanese narration length limit for the target seconds."""
+        return max(8, min(32, int(float(duration) * 5.5)))
+
+
+
+    def _build_partner_full_narration(self, intent: str, llm_text: str, target_duration: float) -> str:
+        """
+        Build one continuous narration that must clearly express the partner-seeking theme.
+        The LLM text can be used only when it already contains the key theme.
+        """
+        import re
+
+        target_duration = max(float(target_duration or 1), 1.0)
+        char_limit = max(22, int(target_duration * 5.8))
+
+        candidate = re.sub(r"\s+", "", (llm_text or "").strip())
+
+        required_keywords = ("38?", "40?", "??", "??")
+        has_theme = all(keyword in candidate for keyword in required_keywords)
+
+        # For this project, theme clarity is more important than preserving generic LLM wording.
+        if target_duration <= 8:
+            text = "38???????40??????????????????????????"
+        elif target_duration <= 12:
+            text = "38???????40?????????????????????????????????????????????????"
+        elif target_duration <= 18:
+            text = "??38??????????????????????????????????????40??????????????????????????????????"
+        elif target_duration <= 25:
+            text = "??38?????????????????????????????????????????????????40?????????????????????????????????????????????????????????"
+        else:
+            text = "??38????????????????????????????????????????????????????????????????40?????????????????????????????????????????????????????????????????????????"
+
+        # If LLM already strongly includes the theme and fits, allow it.
+        if has_theme and 20 <= len(candidate) <= char_limit:
+            text = candidate
+
+        if len(text) <= char_limit:
+            return text
+
+        sentences = re.split(r"(?<=[???!?])", text)
+        result = ""
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            if len(result + sentence) <= char_limit:
+                result += sentence
+
+        if result:
+            return result
+
+        return text[:char_limit].rstrip("????!?") + "?"
+
+
+    def _compact_full_narration(self, text: str, target_duration: float) -> str:
+        """
+        Keep one continuous Japanese narration roughly within target duration.
+        """
+        import re
+
+        target_duration = max(float(target_duration or 1), 1.0)
+
+        # Japanese narration rough estimate:
+        # 5.5 - 6 chars per second is usually safer for gentle female narration.
+        char_limit = max(18, int(target_duration * 5.8))
+
+        text = (text or "").strip()
+        text = re.sub(r"\s+", "", text)
+
+        if not text:
+            text = "?????????????????????????????????????"
+
+        if len(text) <= char_limit:
+            return text
+
+        sentences = re.split(r"(?<=[???!?])", text)
+        result = ""
+
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            if len(result + sentence) <= char_limit:
+                result += sentence
+
+        if result:
+            return result
+
+        return text[:char_limit].rstrip("????!?") + "?"
+
+
+    def _normalize_script_to_scene_plan(
+        self,
+        raw_script: List[Dict[str, Any]],
+        scene_plan: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Force LLM output to match the planned scene count, order, assets and durations."""
+        normalized: List[Dict[str, Any]] = []
+
+        for idx, planned in enumerate(scene_plan):
+            raw_scene = raw_script[idx] if idx < len(raw_script) else {}
+            narrations = raw_scene.get("narrations") or raw_scene.get("narration") or []
+
+            if isinstance(narrations, str):
+                narrations = [narrations]
+
+            narration_text = " ".join(str(item).strip() for item in narrations if str(item).strip())
+            narration_text = self._compact_narration(
+                narration_text,
+                planned["max_narration_chars"],
+                is_last=(idx == len(scene_plan) - 1),
+            )
+
+            normalized.append({
+                "scene_number": planned["scene_number"],
+                "asset_path": planned["asset_path"],
+                "narrations": [narration_text],
+                "duration": planned["duration"],
+            })
+
+        return normalized
+
+    def _compact_narration(self, text: str, limit: int, is_last: bool = False) -> str:
+        """Keep narration short enough for the planned scene duration."""
+        import re
+
+        text = (text or "").strip()
+        text = re.sub(r"\s+", "", text)
+
+        if not text:
+            text = (
+                "?????????????????????????"
+                if is_last
+                else "???????????????????"
+            )
+
+        if len(text) <= limit:
+            return text
+
+        parts = re.split(r"(?<=[???!?])", text)
+        result = ""
+
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            if len(result + part) <= limit:
+                result += part
+
+        if result:
+            return result
+
+        return text[:limit].rstrip("????!?") + "?"
+
     # Helper methods
     
     def _get_asset_type(self, path: Path) -> str:
@@ -1015,6 +1298,94 @@ class AssetBasedPipeline(LinearVideoPipeline):
         except Exception as exc:
             logger.warning(f"Failed to extract tail frame from {video_path}: {exc}")
         return None
+
+
+    def _create_silent_audio(self, output_path: str, duration: float) -> str:
+        """Create silent audio for a visual segment."""
+        try:
+            import subprocess
+
+            duration = max(float(duration or 1.0), 0.5)
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=channel_layout=stereo:sample_rate=44100",
+                "-t",
+                f"{duration:.3f}",
+                "-y",
+                output_path,
+            ]
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            return output_path
+        except Exception as exc:
+            logger.error(f"Failed to create silent audio: {exc}")
+            raise
+
+    def _fit_audio_to_duration(self, input_audio: str, target_duration: float, output_audio: str) -> str:
+        """Speed-adjust narration audio so it roughly matches target video duration."""
+        try:
+            import subprocess
+
+            target_duration = max(float(target_duration or 1.0), 1.0)
+            audio_duration = self._probe_video_duration(input_audio)
+
+            if audio_duration <= 0:
+                return input_audio
+
+            tempo = audio_duration / target_duration
+
+            # Small differences do not need processing.
+            if 0.96 <= tempo <= 1.04:
+                return input_audio
+
+            filters = []
+            remaining = tempo
+
+            while remaining > 2.0:
+                filters.append("atempo=2.0")
+                remaining /= 2.0
+
+            while remaining < 0.5:
+                filters.append("atempo=0.5")
+                remaining /= 0.5
+
+            filters.append(f"atempo={remaining:.6f}")
+
+            Path(output_audio).parent.mkdir(parents=True, exist_ok=True)
+
+            cmd = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                input_audio,
+                "-filter:a",
+                ",".join(filters),
+                "-y",
+                output_audio,
+            ]
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+
+            if Path(output_audio).exists():
+                logger.info(
+                    f"Fitted narration audio: original={audio_duration:.2f}s, "
+                    f"target={target_duration:.2f}s, tempo={tempo:.3f}"
+                )
+                return output_audio
+
+            return input_audio
+        except Exception as exc:
+            logger.warning(f"Failed to fit narration audio duration: {exc}")
+            return input_audio
+
 
     def _probe_video_duration(self, video_path: str) -> float:
         """Return video duration using ffprobe, or 0 on failure."""

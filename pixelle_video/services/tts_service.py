@@ -161,7 +161,7 @@ class TTSService(ComfyBaseService):
         local_config = self.config.get("local", {})
         
         # Determine voice and speed (param > config)
-        final_voice = voice or local_config.get("voice", "zh-CN-YunjianNeural")
+        final_voice = voice or local_config.get("voice", "ja-JP-NanamiNeural")
         final_speed = speed if speed is not None else local_config.get("speed", 1.2)
         
         # Convert speed to rate parameter

@@ -417,7 +417,8 @@ class FrameProcessor:
                 audio=frame.audio_path,
                 output=output_path,
                 replace_audio=True,  # Replace video audio with narration
-                audio_volume=1.0
+                audio_volume=1.0,
+                auto_adjust_duration=False
             )
             
             # Clean up temp file
@@ -434,7 +435,8 @@ class FrameProcessor:
                 image=frame.composed_image_path,
                 audio=frame.audio_path,
                 output=output_path,
-                fps=config.video_fps
+                fps=config.video_fps,
+                duration=getattr(frame, "target_duration", None) or frame.duration or None
             )
         
         else:

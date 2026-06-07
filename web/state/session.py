@@ -53,9 +53,8 @@ def get_pixelle_video():
     import hashlib
     import json
     config_dict = config_manager.config.to_dict()
-    # Only track ComfyUI config for hash (other config changes don't need core recreation)
-    comfyui_config = config_dict.get("comfyui", {})
-    config_hash = hashlib.md5(json.dumps(comfyui_config, sort_keys=True).encode()).hexdigest()
+    # Track all runtime-impacting config, including LLM and API provider settings.
+    config_hash = hashlib.md5(json.dumps(config_dict, sort_keys=True).encode()).hexdigest()
     
     # Check if we need to create or recreate core instance
     need_recreate = False

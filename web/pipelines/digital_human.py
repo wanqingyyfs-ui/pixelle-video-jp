@@ -436,7 +436,7 @@ class DigitalHumanPipelineUI(PipelineUI):
             goods_title = video_params.get("goods_title", "")
             goods_text = video_params.get("goods_text", "")
             mode = video_params.get("mode")
-            tts_voice = video_params.get("tts_voice", "zh-CN-YunjianNeural")
+            tts_voice = video_params.get("tts_voice", "ja-JP-NanamiNeural")
             tts_speed = video_params.get("tts_speed", 1.2)
             
             logger.info(f"🔧 The obtained TTS parameters:")
