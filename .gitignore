@@ -83,3 +83,5 @@ data/
 *.mp3
 *.wav
 *.log
+
+.runtime_env.ps1

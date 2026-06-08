@@ -166,7 +166,7 @@ class TTSService(ComfyBaseService):
         if str(final_voice).startswith("ja-JP-") and final_voice != "ja-JP-NanamiNeural":
             logger.warning(f"Unsupported Japanese Edge TTS voice '{final_voice}', fallback to ja-JP-NanamiNeural")
             final_voice = "ja-JP-NanamiNeural"
-        final_speed = speed if speed is not None else local_config.get("speed", 1.2)
+        final_speed = speed if speed is not None else local_config.get("speed", 1.0)
         
         # Convert speed to rate parameter
         rate = speed_to_rate(final_speed)

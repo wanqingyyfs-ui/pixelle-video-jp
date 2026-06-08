@@ -609,16 +609,7 @@ class AssetBasedPipeline(LinearVideoPipeline):
         progress_range = 0.55  # 85% - 30%
         
         # Generate one continuous narration audio for the whole video.
-        full_narration_text = getattr(context, "full_narration", "") or context.input_text or ""
-        full_audio_path = Path(context.task_dir) / "frames" / "00_full_narration.mp3"
-        full_audio_path.parent.mkdir(parents=True, exist_ok=True)
-
-        await self.core.tts(
-            text=full_narration_text,
-            output_path=str(full_audio_path),
-            voice=config.voice_id,
-            speed=config.tts_speed
-        )
+        # Use the Edge TTS + VTT path below only. Do not generate a separate plain TTS file here.
 
         planned_total_duration = float(getattr(context, "planned_total_duration", 0) or 0)
         if planned_total_duration <= 0:
