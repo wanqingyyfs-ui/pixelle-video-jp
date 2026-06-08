@@ -520,7 +520,7 @@ class AssetBasedPipelineUI(PipelineUI):
                         api_video_workflow=video_params.get("api_video_workflow"),
                         api_video_params=video_params.get("api_video_params"),
                         voice_id=video_params.get("voice_id", "ja-JP-NanamiNeural"),
-                        tts_speed=video_params.get("tts_speed", 1.2),
+                        tts_speed=video_params.get("tts_speed", 1.0),
                         progress_callback=update_progress
                     ))
                     

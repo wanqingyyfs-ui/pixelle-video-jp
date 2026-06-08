@@ -36,6 +36,7 @@ from typing import List, Dict, Any, Optional, Callable
 from pathlib import Path
 import math
 import random
+import json
 from datetime import datetime
 
 from loguru import logger
@@ -345,6 +346,14 @@ class AssetBasedPipeline(LinearVideoPipeline):
         scene_plan = self._build_asset_scene_plan(target_duration=float(duration))
         context.scene_plan = scene_plan
 
+        visual_duration = sum(float(item.get("duration") or 0) for item in scene_plan)
+        target_narration_chars = self._estimate_narration_chars(
+            visual_duration=visual_duration,
+            tts_speed=context.params.get("tts_speed", 1.0),
+        )
+        context.planned_total_duration = visual_duration
+        context.target_narration_chars = target_narration_chars
+
         asset_info = []
         for item in scene_plan:
             asset_info.append(
@@ -363,7 +372,9 @@ class AssetBasedPipeline(LinearVideoPipeline):
             intent=intent,
             duration=duration,
             assets_text=assets_text,
-            title=title
+            title=title,
+            visual_duration=visual_duration,
+            target_narration_chars=target_narration_chars,
         )
         
         # Call LLM with structured output
@@ -378,21 +389,20 @@ class AssetBasedPipeline(LinearVideoPipeline):
         raw_script = [scene.model_dump() for scene in script.scenes]
         context.script = self._normalize_script_to_scene_plan(raw_script, scene_plan)
 
-        planned_total_duration = sum(float(item.get("duration") or 0) for item in scene_plan)
-        context.planned_total_duration = planned_total_duration
-
         fallback_narration = " ".join(
             " ".join(scene.get("narrations") or [])
             for scene in context.script
         )
-        context.full_narration = self._build_partner_full_narration(
-            intent=intent,
+        context.full_narration = await self._prepare_full_narration(
+            context=context,
             llm_text=getattr(script, "full_narration", None) or fallback_narration,
-            target_duration=planned_total_duration,
+            target_chars=target_narration_chars,
+            visual_duration=visual_duration,
         )
         logger.info(
             f"Full narration prepared: chars={len(context.full_narration)}, "
-            f"planned_duration={planned_total_duration:.2f}s"
+            f"visual_duration={visual_duration:.2f}s, "
+            f"target_chars={target_narration_chars}"
         )
         
         # Validate asset paths exist
@@ -521,7 +531,7 @@ class AssetBasedPipeline(LinearVideoPipeline):
             video_fps=30,
             tts_inference_mode="local",
             voice_id=context.params.get("voice_id", "ja-JP-NanamiNeural"),
-            tts_speed=context.params.get("tts_speed", 1.2),
+            tts_speed=context.params.get("tts_speed", 1.0),
             media_width=media_width,
             media_height=media_height,
             frame_template=template_name,
@@ -542,9 +552,9 @@ class AssetBasedPipeline(LinearVideoPipeline):
             if isinstance(narrations, str):
                 narrations = [narrations]
             
-            # Use first narration as the main text (for subtitle)
-            # We'll combine all narrations in the audio
-            main_narration = " ".join(narrations)  # Combine for subtitle display
+            # Scene-level narration is intentionally empty.
+            # Final subtitles are generated from context.full_narration, not from visual scenes.
+            main_narration = ""
             
             frame = StoryboardFrame(
                 index=i,
@@ -617,13 +627,16 @@ class AssetBasedPipeline(LinearVideoPipeline):
                 for frame in storyboard.frames
             )
 
-        fitted_full_audio_path = Path(context.task_dir) / "frames" / "00_full_narration_fitted.mp3"
-        context.full_narration_audio_path = self._fit_audio_to_duration(
-            str(full_audio_path),
-            planned_total_duration,
-            str(fitted_full_audio_path),
+        context.full_narration_audio_path = await self._generate_full_narration_audio_with_retries(
+            context=context,
+            config=config,
+            target_duration=planned_total_duration,
         )
-        logger.info(f"? Full narration audio ready: {context.full_narration_audio_path}")
+        context.full_narration_audio_duration = self._probe_video_duration(context.full_narration_audio_path)
+        logger.info(
+            f"Full narration audio ready: {context.full_narration_audio_path} "
+            f"({context.full_narration_audio_duration:.2f}s)"
+        )
 
         for i, frame in enumerate(storyboard.frames, 1):
             logger.info(f"Producing scene {i}/{total_frames}...")
@@ -833,22 +846,41 @@ class AssetBasedPipeline(LinearVideoPipeline):
 
         full_narration_audio = getattr(context, "full_narration_audio_path", None)
         if full_narration_audio:
-            visual_duration = self._probe_video_duration(str(visual_video_path))
-            fitted_audio_path = Path(context.task_dir) / "frames" / "00_full_narration_final_fit.mp3"
-            final_audio = self._fit_audio_to_duration(
-                full_narration_audio,
-                visual_duration,
-                str(fitted_audio_path),
-            )
+            narrated_video_path = Path(context.task_dir) / f"narrated_{filename}"
 
             self.core.video.merge_audio_video(
                 video=str(visual_video_path),
-                audio=final_audio,
-                output=str(final_video_path),
+                audio=full_narration_audio,
+                output=str(narrated_video_path),
                 replace_audio=False,
                 audio_volume=1.0,
                 video_volume=1.0,
-                auto_adjust_duration=False,
+                auto_adjust_duration=True,
+            )
+
+            final_duration = self._probe_video_duration(str(narrated_video_path))
+            ass_path = Path(context.task_dir) / "full_narration_subtitles.ass"
+            vtt_path = getattr(context, "full_narration_vtt_path", None)
+
+            if vtt_path and Path(vtt_path).exists():
+                self._write_ass_from_vtt(
+                    vtt_path=str(vtt_path),
+                    video_path=str(narrated_video_path),
+                    output_path=str(ass_path),
+                )
+            else:
+                logger.warning("No VTT subtitle timing found, falling back to text-based subtitle timing.")
+                self._write_ass_from_full_narration(
+                    text=getattr(context, "full_narration", ""),
+                    total_duration=final_duration,
+                    video_path=str(narrated_video_path),
+                    output_path=str(ass_path),
+                )
+
+            self._burn_subtitles(
+                video_path=str(narrated_video_path),
+                subtitle_path=str(ass_path),
+                output_path=str(final_video_path),
             )
         else:
             final_video_path = visual_video_path
@@ -1055,154 +1087,899 @@ class AssetBasedPipeline(LinearVideoPipeline):
 
 
 
-    def _build_partner_full_narration(self, intent: str, llm_text: str, target_duration: float) -> str:
+    def _core_theme_keywords(self) -> tuple[str, ...]:
+        return (
+            "\u0033\u0038\u6b73",
+            "\u0034\u0030\u6b73\u4ee5\u4e0a",
+            "\u771f\u5263",
+            "\u51fa\u4f1a",
+            "\u7a4f\u3084\u304b",
+        )
+
+    def _estimate_narration_chars(self, visual_duration: float, tts_speed: float = 1.0) -> int:
         """
-        Build one continuous narration that must clearly express the partner-seeking theme.
-        The LLM text can be used only when it already contains the key theme.
+        Estimate Japanese narration length from target visual duration and fixed TTS speed.
+        Do not time-stretch audio. Generate the correct text length instead.
         """
+        visual_duration = max(float(visual_duration or 1.0), 1.0)
+        try:
+            speed = float(tts_speed or 1.0)
+        except Exception:
+            speed = 1.0
+
+        # Gentle Japanese female narration: about 5.2 chars/sec at 1.0x.
+        chars = int(visual_duration * 5.2 * speed)
+        return max(18, min(chars, 260))
+
+    def _clean_full_narration_text(self, text: str) -> str:
         import re
 
-        target_duration = max(float(target_duration or 1), 1.0)
-        char_limit = max(22, int(target_duration * 5.8))
+        text = str(text or "").strip()
+        text = text.replace("```json", "").replace("```", "").strip()
 
-        candidate = re.sub(r"\s+", "", (llm_text or "").strip())
+        # If a model returns JSON as text, try extracting full_narration.
+        if text.startswith("{") and text.endswith("}"):
+            try:
+                data = json.loads(text)
+                if isinstance(data, dict) and data.get("full_narration"):
+                    text = str(data["full_narration"])
+            except Exception:
+                pass
 
-        required_keywords = ("38?", "40?", "??", "??")
-        has_theme = all(keyword in candidate for keyword in required_keywords)
-
-        # For this project, theme clarity is more important than preserving generic LLM wording.
-        if target_duration <= 8:
-            text = "38???????40??????????????????????????"
-        elif target_duration <= 12:
-            text = "38???????40?????????????????????????????????????????????????"
-        elif target_duration <= 18:
-            text = "??38??????????????????????????????????????40??????????????????????????????????"
-        elif target_duration <= 25:
-            text = "??38?????????????????????????????????????????????????40?????????????????????????????????????????????????????????"
-        else:
-            text = "??38????????????????????????????????????????????????????????????????40?????????????????????????????????????????????????????????????????????????"
-
-        # If LLM already strongly includes the theme and fits, allow it.
-        if has_theme and 20 <= len(candidate) <= char_limit:
-            text = candidate
-
-        if len(text) <= char_limit:
-            return text
-
-        sentences = re.split(r"(?<=[???!?])", text)
-        result = ""
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-            if len(result + sentence) <= char_limit:
-                result += sentence
-
-        if result:
-            return result
-
-        return text[:char_limit].rstrip("????!?") + "?"
-
-
-    def _compact_full_narration(self, text: str, target_duration: float) -> str:
-        """
-        Keep one continuous Japanese narration roughly within target duration.
-        """
-        import re
-
-        target_duration = max(float(target_duration or 1), 1.0)
-
-        # Japanese narration rough estimate:
-        # 5.5 - 6 chars per second is usually safer for gentle female narration.
-        char_limit = max(18, int(target_duration * 5.8))
-
-        text = (text or "").strip()
         text = re.sub(r"\s+", "", text)
+        return text.strip()
 
+    def _has_required_partner_theme(self, text: str) -> bool:
+        text = self._clean_full_narration_text(text)
         if not text:
-            text = "?????????????????????????????????????"
+            return False
 
-        if len(text) <= char_limit:
+        has_age = "\u0033\u0038" in text and "\u0034\u0030" in text
+        has_meeting = any(token in text for token in ("\u51fa\u4f1a", "\u30d1\u30fc\u30c8\u30ca\u30fc", "\u4f34\u4fb6"))
+        has_serious = "\u771f\u5263" in text
+        has_calm = any(token in text for token in ("\u7a4f\u3084\u304b", "\u843d\u3061\u7740\u3044\u305f", "\u8aa0\u5b9f"))
+
+        return has_age and has_meeting and has_serious and has_calm
+
+    async def _prepare_full_narration(
+        self,
+        context: PipelineContext,
+        llm_text: str,
+        target_chars: int,
+        visual_duration: float,
+    ) -> str:
+        """
+        Prepare a continuous narration that is used for both voiceover and subtitles.
+        Text length is controlled here. Audio speed is not modified.
+        """
+        text = self._clean_full_narration_text(llm_text)
+        min_chars = max(12, int(target_chars * 0.82))
+        max_chars = max(min_chars + 4, int(target_chars * 1.18))
+
+        if self._has_required_partner_theme(text) and min_chars <= len(text) <= max_chars:
             return text
 
-        sentences = re.split(r"(?<=[???!?])", text)
-        result = ""
+        return await self._rewrite_full_narration_to_length(
+            context=context,
+            current_text=text,
+            target_chars=target_chars,
+            visual_duration=visual_duration,
+            reason="initial_validation",
+        )
 
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-            if len(result + sentence) <= char_limit:
-                result += sentence
+    async def _rewrite_full_narration_to_length(
+        self,
+        context: PipelineContext,
+        current_text: str,
+        target_chars: int,
+        visual_duration: float,
+        reason: str,
+    ) -> str:
+        """
+        Ask the configured LLM to rewrite the full narration to the required length.
+        Source code uses unicode escapes to avoid PowerShell encoding damage.
+        """
+        target_chars = max(18, int(target_chars))
+        min_chars = max(12, int(target_chars * 0.88))
+        max_chars = max(min_chars + 4, int(target_chars * 1.12))
 
-        if result:
-            return result
+        keywords = ", ".join(self._core_theme_keywords())
+        intent = context.request.get("intent") or context.input_text or ""
 
-        return text[:char_limit].rstrip("????!?") + "?"
+        prompt = f"""
+You are rewriting a Japanese voiceover for a short video.
 
+The voiceover must be ONE continuous natural Japanese monologue.
+It will be used as BOTH the final voiceover and the final subtitles.
+
+Target visual duration: {visual_duration:.2f} seconds.
+Target length: about {target_chars} Japanese characters.
+Acceptable length range: {min_chars}-{max_chars} Japanese characters.
+
+Required ideas / keywords:
+{keywords}
+
+Tone:
+- gentle
+- natural
+- sincere
+- warm
+- slightly lonely but positive
+- first person, as a 38-year-old single woman
+- addressed toward calm sincere men over 40
+- soft spoken Japanese, not stiff written Japanese
+- short natural sentences with gentle pauses
+- sounds like a real woman speaking quietly, not a narrator reading an advertisement
+
+Avoid:
+- Chinese
+- English
+- cheap advertisement style
+- exaggerated sadness
+- vulgar language
+- dependency or begging
+
+User intent:
+{intent}
+
+Current narration:
+{current_text}
+
+Reason for rewrite:
+{reason}
+
+Return ONLY the rewritten Japanese narration. No markdown. No explanation.
+""".strip()
+
+        try:
+            result = await self.core.llm(
+                prompt=prompt,
+                temperature=0.4,
+                max_tokens=700,
+            )
+            rewritten = self._clean_full_narration_text(str(result))
+
+            if rewritten:
+                logger.info(
+                    f"Rewritten full narration: chars={len(rewritten)}, "
+                    f"target={target_chars}, reason={reason}"
+                )
+                return rewritten
+        except Exception as exc:
+            logger.warning(f"Failed to rewrite full narration with LLM: {exc}")
+
+        return self._clean_full_narration_text(current_text)
+
+    async def _generate_full_narration_audio_with_retries(
+        self,
+        context: PipelineContext,
+        config,
+        target_duration: float,
+    ) -> str:
+        """
+        Generate full narration audio and VTT subtitles together using Edge TTS.
+
+        This keeps subtitle timing aligned with the actual TTS voice rhythm.
+        Audio is never time-stretched.
+        """
+        target_duration = max(float(target_duration or 1.0), 1.0)
+        lower = target_duration * 0.88
+        upper = target_duration * 1.12
+
+        frames_dir = Path(context.task_dir) / "frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+        current_text = self._clean_full_narration_text(getattr(context, "full_narration", ""))
+        last_audio_path = None
+        last_vtt_path = None
+        last_duration = 0.0
+
+        for attempt in range(3):
+            audio_path = frames_dir / f"00_full_narration_attempt_{attempt + 1}.mp3"
+            vtt_path = frames_dir / f"00_full_narration_attempt_{attempt + 1}.vtt"
+
+            self._generate_edge_tts_audio_and_vtt(
+                text=current_text,
+                voice=config.voice_id or "ja-JP-NanamiNeural",
+                speed=config.tts_speed or 1.0,
+                audio_path=str(audio_path),
+                vtt_path=str(vtt_path),
+            )
+
+            actual_duration = self._probe_video_duration(str(audio_path))
+            last_audio_path = str(audio_path)
+            last_vtt_path = str(vtt_path)
+            last_duration = actual_duration
+
+            logger.info(
+                f"Full narration TTS attempt {attempt + 1}: "
+                f"actual={actual_duration:.2f}s, target={target_duration:.2f}s, "
+                f"chars={len(current_text)}, vtt={vtt_path.exists()}"
+            )
+
+            if lower <= actual_duration <= upper:
+                context.full_narration = current_text
+                context.full_narration_vtt_path = str(vtt_path)
+                return str(audio_path)
+
+            if attempt >= 2 or actual_duration <= 0:
+                break
+
+            adjusted_chars = int(len(current_text) * target_duration / actual_duration)
+            adjusted_chars = max(18, min(adjusted_chars, 260))
+
+            reason = (
+                "audio_too_long_make_text_shorter"
+                if actual_duration > upper
+                else "audio_too_short_make_text_longer"
+            )
+
+            current_text = await self._rewrite_full_narration_to_length(
+                context=context,
+                current_text=current_text,
+                target_chars=adjusted_chars,
+                visual_duration=target_duration,
+                reason=reason,
+            )
+
+        context.full_narration = current_text
+        context.full_narration_vtt_path = last_vtt_path
+
+        logger.warning(
+            f"Using closest full narration audio after retries: "
+            f"duration={last_duration:.2f}s, target={target_duration:.2f}s"
+        )
+        return last_audio_path
+
+    def _edge_tts_rate(self, speed: float) -> str:
+        """Convert speed multiplier to Edge TTS CLI rate."""
+        try:
+            speed = float(speed or 1.0)
+        except Exception:
+            speed = 1.0
+
+        percent = int(round((speed - 1.0) * 100))
+        sign = "+" if percent >= 0 else ""
+        return f"{sign}{percent}%"
+
+    def _generate_edge_tts_audio_and_vtt(
+        self,
+        text: str,
+        voice: str,
+        speed: float,
+        audio_path: str,
+        vtt_path: str,
+    ) -> None:
+        """
+        Generate audio and VTT subtitle timestamps in the same Edge TTS run.
+        Only ja-JP-NanamiNeural is trusted in this local environment.
+        """
+        import subprocess
+        import sys
+
+        if str(voice).startswith("ja-JP-") and voice != "ja-JP-NanamiNeural":
+            logger.warning(f"Unsupported Japanese voice '{voice}', fallback to ja-JP-NanamiNeural")
+            voice = "ja-JP-NanamiNeural"
+
+        Path(audio_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(vtt_path).parent.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            sys.executable,
+            "-m",
+            "edge_tts",
+            "--voice",
+            voice,
+            "--rate",
+            self._edge_tts_rate(speed),
+            "--text",
+            text,
+            "--write-media",
+            audio_path,
+            "--write-subtitles",
+            vtt_path,
+        ]
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"edge_tts failed: {result.stderr or result.stdout}")
+
+        if not Path(audio_path).exists() or Path(audio_path).stat().st_size <= 0:
+            raise RuntimeError(f"Edge TTS did not create audio: {audio_path}")
+
+        if not Path(vtt_path).exists() or Path(vtt_path).stat().st_size <= 0:
+            raise RuntimeError(f"Edge TTS did not create VTT subtitles: {vtt_path}")
 
     def _normalize_script_to_scene_plan(
         self,
         raw_script: List[Dict[str, Any]],
         scene_plan: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """Force LLM output to match the planned scene count, order, assets and durations."""
+        """
+        Force LLM output to match the planned visual schedule.
+        Scene narrations are intentionally empty because final subtitles come from full_narration.
+        """
         normalized: List[Dict[str, Any]] = []
 
-        for idx, planned in enumerate(scene_plan):
-            raw_scene = raw_script[idx] if idx < len(raw_script) else {}
-            narrations = raw_scene.get("narrations") or raw_scene.get("narration") or []
-
-            if isinstance(narrations, str):
-                narrations = [narrations]
-
-            narration_text = " ".join(str(item).strip() for item in narrations if str(item).strip())
-            narration_text = self._compact_narration(
-                narration_text,
-                planned["max_narration_chars"],
-                is_last=(idx == len(scene_plan) - 1),
-            )
-
+        for planned in scene_plan:
             normalized.append({
                 "scene_number": planned["scene_number"],
                 "asset_path": planned["asset_path"],
-                "narrations": [narration_text],
+                "narrations": [""],
                 "duration": planned["duration"],
             })
 
         return normalized
 
     def _compact_narration(self, text: str, limit: int, is_last: bool = False) -> str:
-        """Keep narration short enough for the planned scene duration."""
+        """
+        Deprecated scene-level narration compactor.
+
+        Final subtitles now come from full_narration, not scene narrations.
+        This method is kept only for backward compatibility.
+        """
         import re
 
         text = (text or "").strip()
         text = re.sub(r"\s+", "", text)
 
         if not text:
-            text = (
-                "?????????????????????????"
-                if is_last
-                else "???????????????????"
-            )
+            return ""
 
         if len(text) <= limit:
             return text
 
-        parts = re.split(r"(?<=[???!?])", text)
-        result = ""
+        return text[:limit].rstrip("\u3001\u3002\uff01\uff1f!?") + "\u3002"
 
-        for part in parts:
+
+    def _split_full_narration_for_subtitles(self, text: str, max_chars: int = 22) -> List[str]:
+        """
+        Split full narration into safe subtitle chunks.
+
+        Rules:
+        - Keep every subtitle short enough to stay inside screen.
+        - Prefer punctuation split.
+        - Wrap long subtitle into two lines.
+        """
+        import re
+
+        text = self._clean_full_narration_text(text)
+        if not text:
+            return []
+
+        max_chars = max(12, min(int(max_chars or 22), 24))
+        rough_parts = re.split(r"(?<=[\u3002\uff01\uff1f!?])", text)
+        chunks: List[str] = []
+
+        for part in rough_parts:
             part = part.strip()
             if not part:
                 continue
-            if len(result + part) <= limit:
-                result += part
 
-        if result:
-            return result
+            while len(part) > max_chars:
+                cut = max_chars
 
-        return text[:limit].rstrip("????!?") + "?"
+                # Prefer Japanese comma or normal comma before hard cutting.
+                for sep in ("\u3001", "\uff0c", ","):
+                    pos = part.rfind(sep, 0, max_chars + 1)
+                    if pos >= 6:
+                        cut = pos + 1
+                        break
+
+                chunk = part[:cut].strip()
+                if chunk:
+                    chunks.append(self._wrap_subtitle_chunk(chunk))
+                part = part[cut:].strip()
+
+            if part:
+                chunks.append(self._wrap_subtitle_chunk(part))
+
+        return [chunk for chunk in chunks if chunk]
+
+    def _wrap_subtitle_chunk(self, text: str, line_limit: int = 11) -> str:
+        """
+        Wrap one subtitle chunk into one or two lines.
+        This prevents long Japanese subtitles from running outside the screen.
+        """
+        text = (text or "").strip()
+        line_limit = max(8, min(int(line_limit or 11), 13))
+
+        if len(text) <= line_limit:
+            return text
+
+        if len(text) <= line_limit * 2:
+            split_at = len(text) // 2
+
+            # Prefer punctuation around the center.
+            candidates = []
+            for sep in ("\u3001", "\uff0c", ","):
+                pos = text.rfind(sep, 0, split_at + 3)
+                if pos >= 5:
+                    candidates.append(pos + 1)
+
+            if candidates:
+                split_at = candidates[-1]
+
+            return text[:split_at].strip() + "\n" + text[split_at:].strip()
+
+        first = text[:line_limit].strip()
+        second = text[line_limit:line_limit * 2].strip()
+        return first + "\n" + second
+
+    def _format_srt_time(self, seconds: float) -> str:
+        seconds = max(float(seconds or 0), 0.0)
+        millis = int(round((seconds - int(seconds)) * 1000))
+        total_seconds = int(seconds)
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        secs = total_seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+
+    def _probe_video_size(self, video_path: str) -> tuple[int, int]:
+        """Return video width and height. Fallback to 1080x1920."""
+        import subprocess
+
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=s=x:p=0",
+            video_path,
+        ]
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            raw = result.stdout.strip()
+            width, height = raw.split("x")
+            return int(width), int(height)
+        except Exception as exc:
+            logger.warning(f"Failed to probe video size, fallback to 1080x1920: {exc}")
+            return 1080, 1920
+
+    def _format_ass_time(self, seconds: float) -> str:
+        """ASS time format: H:MM:SS.CS"""
+        seconds = max(float(seconds or 0), 0.0)
+        total_cs = int(round(seconds * 100))
+        cs = total_cs % 100
+        total_seconds = total_cs // 100
+        s = total_seconds % 60
+        m = (total_seconds // 60) % 60
+        h = total_seconds // 3600
+        return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
+
+    def _escape_ass_text(self, text: str) -> str:
+        """Escape subtitle text for ASS dialogue line."""
+        lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+        safe = r"\N".join(lines)
+        safe = safe.replace("{", "").replace("}", "")
+        return safe
+
+    def _parse_vtt_time(self, value: str) -> float:
+        """Parse VTT timestamp to seconds."""
+        value = str(value or "").strip().replace(",", ".")
+        parts = value.split(":")
+
+        try:
+            if len(parts) == 3:
+                hours = int(parts[0])
+                minutes = int(parts[1])
+                seconds = float(parts[2])
+                return hours * 3600 + minutes * 60 + seconds
+
+            if len(parts) == 2:
+                minutes = int(parts[0])
+                seconds = float(parts[1])
+                return minutes * 60 + seconds
+        except Exception:
+            return 0.0
+
+        return 0.0
+
+    def _clean_vtt_text(self, value: str) -> str:
+        """Clean VTT cue text."""
+        import re
+
+        value = str(value or "").strip()
+        value = re.sub(r"<[^>]+>", "", value)
+        value = value.replace("&nbsp;", " ")
+        value = value.replace("&amp;", "&")
+        value = value.replace("&lt;", "<")
+        value = value.replace("&gt;", ">")
+        return value.strip()
+
+    def _read_vtt_cues(self, vtt_path: str) -> List[Dict[str, Any]]:
+        """Read Edge TTS VTT cues."""
+        lines = Path(vtt_path).read_text(encoding="utf-8-sig").splitlines()
+        cues: List[Dict[str, Any]] = []
+
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+
+            if "-->" not in line:
+                i += 1
+                continue
+
+            start_raw, end_raw = [part.strip() for part in line.split("-->", 1)]
+            end_raw = end_raw.split(" ")[0].strip()
+
+            start = self._parse_vtt_time(start_raw)
+            end = self._parse_vtt_time(end_raw)
+
+            i += 1
+            text_lines = []
+
+            while i < len(lines) and lines[i].strip():
+                text_lines.append(lines[i].strip())
+                i += 1
+
+            cue_text = self._clean_vtt_text("".join(text_lines))
+
+            if cue_text and end > start:
+                cues.append({
+                    "start": start,
+                    "end": end,
+                    "text": cue_text,
+                })
+
+            i += 1
+
+        return cues
+
+    def _group_vtt_cues_for_subtitles(
+        self,
+        cues: List[Dict[str, Any]],
+        max_chars: int = 18,
+        line_limit: int = 9,
+    ) -> List[Dict[str, Any]]:
+        """
+        Group Edge TTS VTT cues into readable subtitle chunks.
+
+        The start/end time comes from actual TTS cue timestamps.
+        This is much closer to the voice rhythm than proportional timing.
+        """
+        groups: List[Dict[str, Any]] = []
+        current_text = ""
+        current_start = None
+        current_end = None
+
+        sentence_end = ("\u3002", "\uff01", "\uff1f", "!", "?")
+        soft_break = ("\u3001", "\uff0c", ",")
+
+        for cue in cues:
+            cue_text = str(cue.get("text") or "").strip()
+            if not cue_text:
+                continue
+
+            if current_start is None:
+                current_start = float(cue["start"])
+
+            candidate = current_text + cue_text
+            current_end = float(cue["end"])
+
+            should_flush = False
+
+            if len(candidate) >= max_chars:
+                should_flush = True
+            if cue_text.endswith(sentence_end):
+                should_flush = True
+            if len(candidate) >= max_chars - 4 and cue_text.endswith(soft_break):
+                should_flush = True
+
+            current_text = candidate
+
+            if should_flush:
+                groups.append({
+                    "start": current_start,
+                    "end": current_end,
+                    "text": self._wrap_subtitle_chunk(current_text, line_limit=line_limit),
+                })
+                current_text = ""
+                current_start = None
+                current_end = None
+
+        if current_text and current_start is not None and current_end is not None:
+            groups.append({
+                "start": current_start,
+                "end": current_end,
+                "text": self._wrap_subtitle_chunk(current_text, line_limit=line_limit),
+            })
+
+        # Add tiny breathing room but do not overlap next subtitle.
+        for index, group in enumerate(groups):
+            if index + 1 < len(groups):
+                group["end"] = min(group["end"] + 0.08, groups[index + 1]["start"] - 0.02)
+            else:
+                group["end"] = group["end"] + 0.10
+
+            if group["end"] <= group["start"]:
+                group["end"] = group["start"] + 0.35
+
+        return groups
+
+    def _write_ass_from_vtt(self, vtt_path: str, video_path: str, output_path: str) -> str:
+        """
+        Convert Edge TTS VTT timing to ASS subtitles.
+
+        This makes subtitle switching follow the actual TTS voice timing.
+        """
+        width, height = self._probe_video_size(video_path)
+
+        # Bigger TikTok vertical subtitle.
+        # For 1080px width, font_size ~= 83.
+        font_size = max(72, min(96, int(width / 13)))
+
+        # Lower area, not glued to bottom.
+        margin_v = max(230, min(360, int(height * 0.14)))
+        margin_lr = max(60, int(width * 0.06))
+
+        cues = self._read_vtt_cues(vtt_path)
+        groups = self._group_vtt_cues_for_subtitles(
+            cues,
+            max_chars=18,
+            line_limit=9,
+        )
+
+        if not groups:
+            raise RuntimeError(f"No subtitle groups generated from VTT: {vtt_path}")
+
+        events = []
+        for group in groups:
+            events.append(
+                "Dialogue: 0,"
+                f"{self._format_ass_time(group['start'])},"
+                f"{self._format_ass_time(group['end'])},"
+                "Default,,0,0,0,,"
+                f"{self._escape_ass_text(group['text'])}"
+            )
+
+        ass = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {width}
+PlayResY: {height}
+ScaledBorderAndShadow: yes
+WrapStyle: 0
+YCbCr Matrix: TV.709
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Meiryo,{font_size},&H00FFFFFF,&H00FFFFFF,&HAA000000,&H66000000,1,0,0,0,100,100,0,0,1,2.6,0.8,2,{margin_lr},{margin_lr},{margin_v},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+{chr(10).join(events)}
+"""
+
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_text(ass, encoding="utf-8-sig")
+
+        logger.info(
+            f"Wrote ASS subtitles from VTT: {output_path}, "
+            f"vtt_cues={len(cues)}, groups={len(groups)}, "
+            f"font_size={font_size}, margin_v={margin_v}, size={width}x{height}"
+        )
+
+        return output_path
+
+
+    def _write_ass_from_full_narration(
+        self,
+        text: str,
+        total_duration: float,
+        video_path: str,
+        output_path: str,
+    ) -> str:
+        """
+        Generate ASS subtitles from full_narration.
+
+        This is more reliable than SRT + force_style on Windows/FFmpeg.
+        Position: lower area, not glued to bottom.
+        Font size: dynamic and small enough to stay inside screen.
+        """
+        width, height = self._probe_video_size(video_path)
+
+        # For 1080x1920, font_size ~= 30.
+        # This is clearly visible but much smaller than the original big HTML subtitles.
+        font_size = max(62, min(86, int(width / 14)))
+
+        # Lower area but not at the very bottom.
+        # For 1920 height, MarginV ~= 345, placing subtitles around lower 75%-82%.
+        margin_v = max(260, min(420, int(height * 0.18)))
+        margin_lr = max(70, int(width * 0.08))
+
+        chunks = self._split_full_narration_for_subtitles(text, max_chars=22)
+        total_duration = max(float(total_duration or 1.0), 1.0)
+
+        if not chunks:
+            raise RuntimeError("No subtitle chunks generated from full_narration; refusing to output video without subtitles.")
+
+        weights = [max(len(chunk.replace("\\n", "")), 1) for chunk in chunks]
+        total_weight = sum(weights)
+
+        current = 0.0
+        events = []
+
+        for index, (chunk, weight) in enumerate(zip(chunks, weights), start=1):
+            if index == len(chunks):
+                end = total_duration
+            else:
+                duration = max(0.95, total_duration * weight / total_weight)
+                end = min(total_duration, current + duration)
+
+            if end <= current:
+                end = min(total_duration, current + 0.95)
+
+            events.append(
+                "Dialogue: 0,"
+                f"{self._format_ass_time(current)},"
+                f"{self._format_ass_time(end)},"
+                "Default,,0,0,0,,"
+                f"{self._escape_ass_text(chunk)}"
+            )
+
+            current = end
+
+        ass = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {width}
+PlayResY: {height}
+ScaledBorderAndShadow: yes
+WrapStyle: 0
+YCbCr Matrix: TV.709
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Meiryo,{font_size},&H00FFFFFF,&H00FFFFFF,&HAA000000,&H66000000,0,0,0,0,100,100,0,0,1,2.0,0.5,2,{margin_lr},{margin_lr},{margin_v},1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+{chr(10).join(events)}
+"""
+
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_text(ass, encoding="utf-8-sig")
+
+        logger.info(
+            f"Wrote ASS subtitles: {output_path}, chunks={len(chunks)}, "
+            f"font_size={font_size}, margin_v={margin_v}, margin_lr={margin_lr}, size={width}x{height}"
+        )
+
+        return output_path
+
+
+    def _write_srt_from_full_narration(self, text: str, total_duration: float, output_path: str) -> str:
+        """
+        Generate SRT subtitles from full_narration.
+        Subtitle timing follows the full narration duration, not visual scenes.
+        """
+        chunks = self._split_full_narration_for_subtitles(text, max_chars=22)
+        total_duration = max(float(total_duration or 1.0), 1.0)
+
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+        if not chunks:
+            Path(output_path).write_text("", encoding="utf-8")
+            return output_path
+
+        weights = [max(len(chunk.replace("\n", "")), 1) for chunk in chunks]
+        total_weight = sum(weights)
+        current = 0.0
+        lines = []
+
+        for index, (chunk, weight) in enumerate(zip(chunks, weights), start=1):
+            if index == len(chunks):
+                end = total_duration
+            else:
+                duration = total_duration * weight / total_weight
+                duration = max(0.9, duration)
+                end = min(total_duration, current + duration)
+
+            if end <= current:
+                end = min(total_duration, current + 0.8)
+
+            lines.append(str(index))
+            lines.append(f"{self._format_srt_time(current)} --> {self._format_srt_time(end)}")
+            lines.append(chunk)
+            lines.append("")
+
+            current = end
+
+        Path(output_path).write_text("\n".join(lines), encoding="utf-8")
+        logger.info(f"Wrote full narration subtitles: {output_path}, chunks={len(chunks)}")
+        return output_path
+
+    def _escape_subtitle_filter_path(self, path: str) -> str:
+        value = Path(path).resolve().as_posix()
+        value = value.replace(":", r"\:")
+        value = value.replace("'", r"\\'")
+        return value
+
+    def _burn_subtitles(self, video_path: str, subtitle_path: str = None, output_path: str = None, srt_path: str = None) -> str:
+        """
+        Burn ASS subtitles into the final video.
+
+        Important:
+        - Do NOT silently copy video if subtitle burn fails.
+        - If subtitles fail, raise the FFmpeg error so we can fix it.
+        """
+        import subprocess
+
+        subtitle_path = subtitle_path or srt_path
+        if not subtitle_path:
+            raise RuntimeError("subtitle_path is required for subtitle burning.")
+
+        if not Path(subtitle_path).exists():
+            raise RuntimeError(f"Subtitle file does not exist: {subtitle_path}")
+
+        if Path(subtitle_path).stat().st_size <= 0:
+            raise RuntimeError(f"Subtitle file is empty: {subtitle_path}")
+
+        subtitle_file = Path(subtitle_path).resolve().as_posix()
+        subtitle_file = subtitle_file.replace(":", r"\:")
+        subtitle_file = subtitle_file.replace("'", r"\\'")
+
+        vf = f"ass='{subtitle_file}'"
+
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            video_path,
+            "-vf",
+            vf,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-c:a",
+            "copy",
+            "-movflags",
+            "+faststart",
+            "-y",
+            output_path,
+        ]
+
+        logger.info(f"Burning subtitles with ASS filter: {subtitle_path}")
+
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            if not Path(output_path).exists() or Path(output_path).stat().st_size <= 0:
+                raise RuntimeError(f"Subtitle burn produced empty output: {output_path}")
+            logger.info(f"Burned subtitles into final video: {output_path}")
+            return output_path
+        except subprocess.CalledProcessError as exc:
+            error = exc.stderr or str(exc)
+            logger.error(f"Subtitle burn failed: {error}")
+            raise RuntimeError(f"Subtitle burn failed. FFmpeg error: {error}")
+        except subprocess.CalledProcessError as exc:
+            logger.warning(f"Subtitle burn failed, fallback to no subtitles: {exc.stderr}")
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(video_path, output_path)
+            return output_path
+        except subprocess.CalledProcessError as exc:
+            logger.warning(f"Subtitle burn failed, fallback to no subtitles: {exc.stderr}")
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            import shutil
+            shutil.copy(video_path, output_path)
+            return output_path
+
 
     # Helper methods
     
@@ -1329,64 +2106,11 @@ class AssetBasedPipeline(LinearVideoPipeline):
             raise
 
     def _fit_audio_to_duration(self, input_audio: str, target_duration: float, output_audio: str) -> str:
-        """Speed-adjust narration audio so it roughly matches target video duration."""
-        try:
-            import subprocess
-
-            target_duration = max(float(target_duration or 1.0), 1.0)
-            audio_duration = self._probe_video_duration(input_audio)
-
-            if audio_duration <= 0:
-                return input_audio
-
-            tempo = audio_duration / target_duration
-
-            # Small differences do not need processing.
-            if 0.96 <= tempo <= 1.04:
-                return input_audio
-
-            filters = []
-            remaining = tempo
-
-            while remaining > 2.0:
-                filters.append("atempo=2.0")
-                remaining /= 2.0
-
-            while remaining < 0.5:
-                filters.append("atempo=0.5")
-                remaining /= 0.5
-
-            filters.append(f"atempo={remaining:.6f}")
-
-            Path(output_audio).parent.mkdir(parents=True, exist_ok=True)
-
-            cmd = [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-i",
-                input_audio,
-                "-filter:a",
-                ",".join(filters),
-                "-y",
-                output_audio,
-            ]
-            subprocess.run(cmd, capture_output=True, text=True, check=True)
-
-            if Path(output_audio).exists():
-                logger.info(
-                    f"Fitted narration audio: original={audio_duration:.2f}s, "
-                    f"target={target_duration:.2f}s, tempo={tempo:.3f}"
-                )
-                return output_audio
-
-            return input_audio
-        except Exception as exc:
-            logger.warning(f"Failed to fit narration audio duration: {exc}")
-            return input_audio
-
-
+        """
+        Deprecated. Do not time-stretch narration audio.
+        Duration must be controlled by narration text length, not by audio filters.
+        """
+        return input_audio
     def _probe_video_duration(self, video_path: str) -> float:
         """Return video duration using ffprobe, or 0 on failure."""
         try:

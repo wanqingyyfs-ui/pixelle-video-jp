@@ -236,6 +236,12 @@ EDGE_TTS_VOICES: List[Dict[str, Any]] = [
     },
 ]
 
+# Keep only verified Japanese voice in this local project environment.
+EDGE_TTS_VOICES = [
+    voice for voice in EDGE_TTS_VOICES
+    if not voice["id"].startswith("ja-JP-") or voice["id"] == "ja-JP-NanamiNeural"
+]
+
 
 def get_voice_display_name(voice_id: str, tr_func=None, locale: str = "zh_CN") -> str:
     """
