@@ -162,9 +162,9 @@ class TTSService(ComfyBaseService):
         
         # Determine voice and speed (param > config)
         final_voice = voice or local_config.get("voice", "ja-JP-NanamiNeural")
-        # Only Nanami is verified stable for Japanese TTS in this local environment.
-        if str(final_voice).startswith("ja-JP-") and final_voice != "ja-JP-NanamiNeural":
-            logger.warning(f"Unsupported Japanese Edge TTS voice '{final_voice}', fallback to ja-JP-NanamiNeural")
+        # This local Japanese-video project only allows Nanami to prevent non-Japanese voiceover.
+        if final_voice != "ja-JP-NanamiNeural":
+            logger.warning(f"Unsupported Edge TTS voice '{final_voice}', fallback to ja-JP-NanamiNeural")
             final_voice = "ja-JP-NanamiNeural"
         final_speed = speed if speed is not None else local_config.get("speed", 1.0)
         
