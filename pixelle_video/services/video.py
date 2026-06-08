@@ -694,14 +694,26 @@ class VideoService:
                 # Use scale filter with force_original_aspect_ratio=decrease and pad to center
                 scaled_video = (
                     input_video
-                    .filter('scale', overlay_width, overlay_height, force_original_aspect_ratio='decrease')
+                    .filter(
+                        'scale',
+                        overlay_width,
+                        overlay_height,
+                        force_original_aspect_ratio='decrease',
+                        force_divisible_by=2
+                    )
                     .filter('pad', overlay_width, overlay_height, '(ow-iw)/2', '(oh-ih)/2', color='black')
                 )
             elif scale_mode == "cover":
                 # Scale to cover (crop if aspect ratio differs)
                 scaled_video = (
                     input_video
-                    .filter('scale', overlay_width, overlay_height, force_original_aspect_ratio='increase')
+                    .filter(
+                        'scale',
+                        overlay_width,
+                        overlay_height,
+                        force_original_aspect_ratio='increase',
+                        force_divisible_by=2
+                    )
                     .filter('crop', overlay_width, overlay_height)
                 )
             else:  # stretch
@@ -709,7 +721,11 @@ class VideoService:
                 scaled_video = input_video.filter('scale', overlay_width, overlay_height)
             
             # Overlay the transparent image on top of the scaled video
-            output_stream = ffmpeg.overlay(scaled_video, input_overlay)
+            output_stream = (
+                ffmpeg
+                .overlay(scaled_video, input_overlay)
+                .filter('scale', 'trunc(iw/2)*2', 'trunc(ih/2)*2')
+            )
             
             (
                 ffmpeg

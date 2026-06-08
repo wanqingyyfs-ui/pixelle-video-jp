@@ -817,6 +817,7 @@ class AssetBasedPipeline(LinearVideoPipeline):
         
         final_video_path = Path(context.task_dir) / filename
         visual_video_path = Path(context.task_dir) / f"visual_{filename}"
+        subtitled_video_path = Path(context.task_dir) / f"subtitled_{filename}"
         
         # Get BGM parameters
         bgm_path = context.request.get("bgm_path")
@@ -871,10 +872,17 @@ class AssetBasedPipeline(LinearVideoPipeline):
             self._burn_subtitles(
                 video_path=str(narrated_video_path),
                 subtitle_path=str(ass_path),
-                output_path=str(final_video_path),
+                output_path=str(subtitled_video_path),
             )
+            fade_source_video_path = subtitled_video_path
         else:
-            final_video_path = visual_video_path
+            fade_source_video_path = visual_video_path
+
+        self._apply_black_fade_in_out(
+            video_path=str(fade_source_video_path),
+            output_path=str(final_video_path),
+            fade_seconds=2.0,
+        )
         
         context.final_video_path = str(final_video_path)
         context.storyboard.final_video_path = str(final_video_path)
@@ -1897,6 +1905,71 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         value = value.replace(":", r"\:")
         value = value.replace("'", r"\\'")
         return value
+
+    def _apply_black_fade_in_out(self, video_path: str, output_path: str, fade_seconds: float = 2.0) -> str:
+        """
+        Apply black fade-in at the beginning and black fade-out at the end.
+        Video only: audio is copied without changing speed or duration.
+        """
+        import subprocess
+
+        if not Path(video_path).exists():
+            raise RuntimeError(f"Fade source video does not exist: {video_path}")
+
+        duration = self._probe_video_duration(video_path)
+        if duration <= 0:
+            raise RuntimeError(f"Cannot apply fade because video duration is invalid: {video_path}")
+
+        fade_seconds = max(0.1, min(float(fade_seconds or 2.0), duration / 2.0))
+        fade_out_start = max(duration - fade_seconds, 0.0)
+
+        vf = (
+            f"fade=t=in:st=0:d={fade_seconds:.3f},"
+            f"fade=t=out:st={fade_out_start:.3f}:d={fade_seconds:.3f}"
+        )
+
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            video_path,
+            "-vf",
+            vf,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "20",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "copy",
+            "-movflags",
+            "+faststart",
+            "-y",
+            output_path,
+        ]
+
+        logger.info(
+            f"Applying black fade in/out: input={video_path}, output={output_path}, "
+            f"duration={duration:.2f}s, fade={fade_seconds:.2f}s"
+        )
+
+        try:
+            subprocess.run(cmd, capture_output=True, text=True, check=True)
+            if not Path(output_path).exists() or Path(output_path).stat().st_size <= 0:
+                raise RuntimeError(f"Fade output is empty: {output_path}")
+            return output_path
+        except subprocess.CalledProcessError as exc:
+            error = exc.stderr or str(exc)
+            logger.error(f"Black fade in/out failed: {error}")
+            raise RuntimeError(f"Black fade in/out failed. FFmpeg error: {error}")
+
 
     def _burn_subtitles(self, video_path: str, subtitle_path: str = None, output_path: str = None, srt_path: str = None) -> str:
         """
